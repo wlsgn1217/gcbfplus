@@ -6,6 +6,7 @@ from .double_integrator import DoubleIntegrator
 from .linear_drone import LinearDrone
 from .dubins_car import DubinsCar
 from .crazyflie import CrazyFlie
+from .custom_env import CustomSingleIntegrator, MapConfig, TaskConfig
 
 
 ENV = {
@@ -14,6 +15,7 @@ ENV = {
     'LinearDrone': LinearDrone,
     'DubinsCar': DubinsCar,
     'CrazyFlie': CrazyFlie,
+    'CustomSingleIntegrator': CustomSingleIntegrator,
 }
 
 

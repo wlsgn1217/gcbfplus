@@ -97,19 +97,13 @@ def test(args):
                 alpha=args.alpha,
             )
             act_fn = jax.jit(algo.act)
-            path = os.path.join(f"./logs/{args.env}/{args.algo}")
-            if not os.path.exists(path):
-                os.makedirs(path)
+            path = args.save_path if args.save_path is not None else os.path.join(f"./logs/{args.env}/{args.algo}")
+            os.makedirs(path, exist_ok=True)
             step = None
     else:
         assert args.env is not None
-        path = os.path.join(f"./logs/{args.env}/nominal")
-        if not os.path.exists("./logs"):
-            os.mkdir("./logs")
-        if not os.path.exists(os.path.join("./logs", args.env)):
-            os.mkdir(os.path.join("./logs", args.env))
-        if not os.path.exists(path):
-            os.mkdir(path)
+        path = args.save_path if args.save_path is not None else os.path.join(f"./logs/{args.env}/nominal")
+        os.makedirs(path, exist_ok=True)
         algo = None
         act_fn = jax.jit(env.u_ref)
         step = 0
@@ -258,6 +252,7 @@ def main():
     parser.add_argument("--epi", type=int, default=5)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--no-video", action="store_true", default=False)
+    parser.add_argument("--save-path", type=str, default=None)
     parser.add_argument("--nojit-rollout", action="store_true", default=False)
     parser.add_argument("--log", action="store_true", default=False)
     parser.add_argument("--dpi", type=int, default=100)

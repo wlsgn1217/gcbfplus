@@ -31,14 +31,17 @@ def make_env(
         max_travel: Optional[float] = None,
         num_obs: Optional[int] = None,
         n_rays: Optional[int] = None,
+        circuit_cfgs: Optional[list] = None,
 ) -> MultiAgentEnv:
     assert env_id in ENV.keys(), f'Environment {env_id} not implemented.'
-    params = ENV[env_id].PARAMS
+    params = dict(ENV[env_id].PARAMS)
     max_step = DEFAULT_MAX_STEP if max_step is None else max_step
     if num_obs is not None:
         params['n_obs'] = num_obs
     if n_rays is not None:
         params['n_rays'] = n_rays
+    if circuit_cfgs is not None:
+        params['circuit_cfgs'] = circuit_cfgs
     return ENV[env_id](
         num_agents=num_agents,
         area_size=area_size,

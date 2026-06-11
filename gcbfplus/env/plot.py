@@ -437,9 +437,9 @@ def render_video_circuit(
         n_agent: int,
         n_rays: int,
         r: float,
-        pickup_pos: np.ndarray,    # (2,)
-        delivery_pos: np.ndarray,  # (k, 2)
-        dropoff_pos: np.ndarray,   # (2,)
+        pickup_pos: np.ndarray,    # (2,) or (n_circuits, 2)
+        delivery_pos,              # (k, 2), (n_circuits, k, 2), or list[(k_i, 2)]
+        dropoff_pos: np.ndarray,   # (2,) or (n_circuits, 2)
         Ta_is_unsafe=None,
         viz_opts: dict = None,
         dpi: int = 100,
@@ -447,17 +447,47 @@ def render_video_circuit(
 ):
     """Like render_video but with circuit-specific visualisation:
     - Robots are colored by mission phase; invisible when inactive.
-    - Fixed station markers for pickup, delivery positions, and drop-off.
+    - Fixed station markers for one or more pickup/delivery/drop-off groups.
     """
     fig, ax = plt.subplots(1, 1, figsize=(10, 10), dpi=dpi)
-    ax.set_xlim(0., side_length)
-    ax.set_ylim(0., side_length)
-    ax.set(aspect="equal")
-    plt.axis("off")
+
+    def set_full_area_view():
+        ax.set_xlim(0.0, side_length)
+        ax.set_ylim(0.0, side_length)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_box_aspect(1)
+        ax.margins(0.0)
+        ax.autoscale(False)
+
+    set_full_area_view()
+    tick_step = side_length / 4.0
+    ticks = np.arange(0.0, side_length + tick_step * 0.5, tick_step)
+    ax.set_xticks(ticks)
+    ax.set_yticks(ticks)
+    ax.tick_params(labelsize=9, colors="0.35", length=3)
+    ax.grid(True, color="0.86", linewidth=0.8, zorder=0)
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_color("0.35")
+        spine.set_linewidth(1.0)
 
     T_graph = rollout.Tp1_graph
     graph0  = tree_index(T_graph, 0)
     n_hits  = n_agent * n_rays
+
+    pickup_pos = np.asarray(pickup_pos, dtype=float)
+    if pickup_pos.ndim == 1:
+        pickup_pos = pickup_pos[None, :]
+    dropoff_pos = np.asarray(dropoff_pos, dtype=float)
+    if dropoff_pos.ndim == 1:
+        dropoff_pos = dropoff_pos[None, :]
+    if isinstance(delivery_pos, np.ndarray):
+        if delivery_pos.ndim == 2:
+            delivery_groups = [delivery_pos]
+        else:
+            delivery_groups = [delivery_pos[ii] for ii in range(delivery_pos.shape[0])]
+    else:
+        delivery_groups = [np.asarray(group, dtype=float) for group in delivery_pos]
 
     # --- static obstacles ---
     obs     = graph0.env_states.obstacle
@@ -465,13 +495,16 @@ def render_video_circuit(
     ax.add_collection(obs_col)
 
     # --- station markers (drawn once, never updated) ---
-    ax.plot(*pickup_pos, marker='*', markersize=20, color='#22aa22',
-            zorder=10, linestyle='none', label='Pickup')
-    ax.plot(*dropoff_pos, marker='X', markersize=16, color='#dd2200',
-            zorder=10, linestyle='none', label='Drop-off')
-    for ii, dp in enumerate(delivery_pos):
-        ax.plot(*dp, marker='s', markersize=14, color='#0068ff',
-                zorder=10, linestyle='none', label=f'Delivery {ii}')
+    for circuit_idx, pickup in enumerate(pickup_pos):
+        ax.plot(*pickup, marker='*', markersize=20, color='#22aa22',
+                zorder=10, linestyle='none', label='Pickup' if circuit_idx == 0 else None)
+    for circuit_idx, dropoff in enumerate(dropoff_pos):
+        ax.plot(*dropoff, marker='X', markersize=16, color='#dd2200',
+                zorder=10, linestyle='none', label='Drop-off' if circuit_idx == 0 else None)
+    for circuit_idx, deliveries in enumerate(delivery_groups):
+        for ii, dp in enumerate(deliveries):
+            ax.plot(*dp, marker='s', markersize=14, color='#0068ff',
+                    zorder=10, linestyle='none', label='Delivery' if circuit_idx == 0 and ii == 0 else None)
 
     # --- agent circles (one per slot) and goal dots (one per slot) ---
     # All start off-screen with zero radius; updated each frame.
@@ -502,14 +535,16 @@ def render_video_circuit(
     if Ta_is_unsafe is not None:
         safe_text = [ax.text(0.02, 1.00, "Unsafe: {}", va="bottom", **text_opts)]
     kk_text   = ax.text(0.99, 0.99, "kk=0", va="top", ha="right", **text_opts)
-    spawned_text = ax.text(0.02, 0.99, "Spawned: 0", va="top", **text_opts)
+    spawned_text = ax.text(0.02, 0.99, "Spawned: []", va="top", **text_opts)
 
     ax.legend(loc="lower right", fontsize=10, markerscale=0.6)
 
     def init_fn():
+        set_full_area_view()
         return [obs_col, agent_col, goal_col, edge_col, cost_text, *safe_text, kk_text, spawned_text]
 
     def update(kk: int):
+        set_full_area_view()
         graph   = tree_index(T_graph, kk)
         n_pos_t = np.array(graph.states[:-1, :2])
         phases  = np.array(graph.env_states.robot_phase)   # (n_agent,) int
@@ -556,7 +591,8 @@ def render_video_circuit(
         if safe_text and Ta_is_unsafe is not None and kk < len(Ta_is_unsafe):
             safe_text[0].set_text("Unsafe: {}".format(np.where(Ta_is_unsafe[kk])[0]))
         kk_text.set_text("kk={:04}".format(kk))
-        spawned_text.set_text("Spawned: {}".format(int(graph.env_states.robots_spawned)))
+        spawned = np.asarray(graph.env_states.robots_spawned, dtype=int).tolist()
+        spawned_text.set_text("Spawned: {}".format(spawned))
 
         return [obs_col, agent_col, goal_col, edge_col, cost_text, *safe_text, kk_text, spawned_text]
 

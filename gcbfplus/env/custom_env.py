@@ -425,8 +425,9 @@ class CircuitConfig:
     Parameters
     ----------
     pickup_pos      : [x, y] where robots spawn and dwell first.
-    delivery_pos    : list of k=2 positions robots can be routed to.
+    delivery_pos    : list of positions robots can be routed to.
     dropoff_pos     : [x, y] where robots dwell last and disappear.
+    max_agents      : maximum active robot slots owned by this circuit.
     total_robots    : how many robots complete the circuit before spawning stops.
     spawn_interval  : seconds between consecutive robot spawns.
     dwell_time      : seconds a robot dwells at each station.
@@ -434,6 +435,7 @@ class CircuitConfig:
     pickup_pos:     List[float]
     delivery_pos:   List[List[float]]
     dropoff_pos:    List[float]
+    max_agents:     int   = 0
     total_robots:   int   = 10
     spawn_interval: float = 5.0
     dwell_time:     float = 0.0
@@ -444,25 +446,18 @@ class CircuitConfig:
 # ---------------------------------------------------------------------------
 
 class CircuitEnv(CustomSingleIntegrator):
-    """Logistics circuit built on top of CustomSingleIntegrator.
+    """Logistics circuits built on top of CustomSingleIntegrator.
 
-    Each robot slot follows a single circuit:
-      spawn at pickup → dwell → travel to a random delivery station →
-      dwell → travel to drop-off → dwell → disappear.
-
-    Parameters
-    ----------
-    num_agents : int
-        Maximum robots active in the scene at the same time.
-    circuit_cfg : CircuitConfig
-        Circuit layout and timing.  If None, taken from params['circuit_cfg'].
-    All other keyword arguments are forwarded to CustomSingleIntegrator.
+    Each robot slot belongs to exactly one circuit and follows:
+      spawn at pickup -> dwell -> travel to a random delivery station ->
+      dwell -> travel to drop-off -> dwell -> disappear.
     """
 
     _DEFAULT_CIRCUIT_CFG = CircuitConfig(
         pickup_pos=[1.0, 1.0],
         delivery_pos=[[3.0, 1.0], [3.0, 3.0]],
         dropoff_pos=[1.0, 3.0],
+        max_agents=1,
         total_robots=10,
         spawn_interval=5.0,
         dwell_time=0.0,
@@ -483,16 +478,18 @@ class CircuitEnv(CustomSingleIntegrator):
         dyn_obs_pos:    Array     # (n_dyn_obs, 2)
         dyn_obs_goal:   Array     # (n_dyn_obs, 2)
         robot_phase:    Array     # (num_agents,) int32
-        robot_timer:    Array     # (num_agents,) int32 — steps in current phase
-        spawn_timer:    Array     # ()  int32 — steps until next spawn
-        robots_spawned: Array     # ()  int32 — total robots spawned so far
-        robot_delivery: Array     # (num_agents, 2) — delivery goal locked at spawn
+        robot_timer:    Array     # (num_agents,) int32, steps in current phase
+        spawn_timer:    Array     # (n_circuits,) int32, steps until next spawn
+        robots_spawned: Array     # (n_circuits,) int32, total robots spawned so far
+        robot_delivery: Array     # (num_agents, 2), delivery goal locked at spawn
+        robot_circuit:  Array     # (num_agents,) int32, fixed circuit ownership
 
     def __init__(
         self,
-        num_agents: int,
-        area_size: float,
+        num_agents: Optional[int] = None,
+        area_size: Optional[float] = None,
         circuit_cfg: Optional[CircuitConfig] = None,
+        circuit_cfgs: Optional[List[CircuitConfig]] = None,
         map_cfg: Optional[MapConfig] = None,
         n_dyn_obs: int = 0,
         dyn_obs_size: float = 0.15,
@@ -502,13 +499,48 @@ class CircuitEnv(CustomSingleIntegrator):
         dt: float = 0.03,
         params: Optional[dict] = None,
     ):
-        if circuit_cfg is None:
-            circuit_cfg = (params or {}).get('circuit_cfg', CircuitEnv._DEFAULT_CIRCUIT_CFG)
-        # strip circuit_cfg from params so parent doesn't see it
-        if params is not None and 'circuit_cfg' in params:
-            params = {k: v for k, v in params.items() if k != 'circuit_cfg'}
+        if area_size is None:
+            raise ValueError("area_size must be provided")
+        if circuit_cfgs is not None and circuit_cfg is not None:
+            raise ValueError("Provide either circuit_cfgs or circuit_cfg, not both")
+
+        params_cfg = (params or {}).get('circuit_cfg', CircuitEnv._DEFAULT_CIRCUIT_CFG)
+        params_cfgs = (params or {}).get('circuit_cfgs', None)
+        explicit_cfgs = circuit_cfgs is not None or params_cfgs is not None
+
+        if circuit_cfgs is None:
+            if params_cfgs is not None:
+                circuit_cfgs = list(params_cfgs)
+            else:
+                cfg = circuit_cfg if circuit_cfg is not None else params_cfg
+                if num_agents is not None:
+                    cfg = CircuitConfig(
+                        pickup_pos=cfg.pickup_pos,
+                        delivery_pos=cfg.delivery_pos,
+                        dropoff_pos=cfg.dropoff_pos,
+                        max_agents=num_agents,
+                        total_robots=cfg.total_robots,
+                        spawn_interval=cfg.spawn_interval,
+                        dwell_time=cfg.dwell_time,
+                    )
+                circuit_cfgs = [cfg]
+
+        if len(circuit_cfgs) == 0:
+            raise ValueError("circuit_cfgs must contain at least one circuit")
+        if any(cfg.max_agents <= 0 for cfg in circuit_cfgs):
+            raise ValueError("Each CircuitConfig in circuit_cfgs must set max_agents > 0")
+        if any(len(cfg.delivery_pos) == 0 for cfg in circuit_cfgs):
+            raise ValueError("Each CircuitConfig must provide at least one delivery position")
+
+        derived_num_agents = int(sum(cfg.max_agents for cfg in circuit_cfgs))
+        if explicit_cfgs and num_agents is not None and num_agents != derived_num_agents:
+            raise ValueError("num_agents must equal sum(max_agents) when circuit_cfgs is provided")
+
+        if params is not None and ('circuit_cfg' in params or 'circuit_cfgs' in params):
+            params = {k: v for k, v in params.items() if k not in ('circuit_cfg', 'circuit_cfgs')}
+
         super().__init__(
-            num_agents=num_agents,
+            num_agents=derived_num_agents,
             area_size=area_size,
             map_cfg=map_cfg,
             n_dyn_obs=n_dyn_obs,
@@ -519,23 +551,32 @@ class CircuitEnv(CustomSingleIntegrator):
             dt=dt,
             params=params,
         )
-        self._circuit_cfg  = circuit_cfg
-        self._pickup       = jnp.array(circuit_cfg.pickup_pos,   dtype=jnp.float32)   # (2,)
-        self._delivery     = jnp.array(circuit_cfg.delivery_pos, dtype=jnp.float32)   # (k, 2)
-        self._dropoff      = jnp.array(circuit_cfg.dropoff_pos,  dtype=jnp.float32)   # (2,)
-        self._garage       = jnp.array([-2.0 * area_size, -2.0 * area_size], dtype=jnp.float32)
-        self._dwell_steps  = int(round(circuit_cfg.dwell_time    / dt))
-        self._spawn_steps  = int(round(circuit_cfg.spawn_interval / dt))
-        self._total_robots = circuit_cfg.total_robots
-
-    # ------------------------------------------------------------------
-    # reset
-    # ------------------------------------------------------------------
+        self._circuit_cfgs = list(circuit_cfgs)
+        self._circuit_cfg = self._circuit_cfgs[0]
+        self._n_circuits = len(self._circuit_cfgs)
+        self._pickup = jnp.array([cfg.pickup_pos for cfg in self._circuit_cfgs], dtype=jnp.float32)
+        self._delivery = [jnp.array(cfg.delivery_pos, dtype=jnp.float32) for cfg in self._circuit_cfgs]
+        self._dropoff = jnp.array([cfg.dropoff_pos for cfg in self._circuit_cfgs], dtype=jnp.float32)
+        self._garage = jnp.array([-2.0 * area_size, -2.0 * area_size], dtype=jnp.float32)
+        self._dwell_steps = jnp.array(
+            [int(round(cfg.dwell_time / dt)) for cfg in self._circuit_cfgs], dtype=jnp.int32
+        )
+        self._spawn_steps = jnp.array(
+            [int(round(cfg.spawn_interval / dt)) for cfg in self._circuit_cfgs], dtype=jnp.int32
+        )
+        self._total_robots = jnp.array([cfg.total_robots for cfg in self._circuit_cfgs], dtype=jnp.int32)
+        self._max_agents_per_circuit = jnp.array([cfg.max_agents for cfg in self._circuit_cfgs], dtype=jnp.int32)
+        self._robot_circuit = jnp.array(
+            [circuit_idx for circuit_idx, cfg in enumerate(self._circuit_cfgs) for _ in range(cfg.max_agents)],
+            dtype=jnp.int32,
+        )
+        self._initial_robot_delivery = jnp.stack([
+            self._delivery[int(circuit_idx)][0] for circuit_idx in np.array(self._robot_circuit)
+        ]).astype(jnp.float32)
 
     def reset(self, key: Array) -> GraphsTuple:
         self._t = 0
 
-        # --- obstacles (reuse parent logic) ---
         if self._fixed_obstacles is not None:
             static_obstacles = self._fixed_obstacles
         else:
@@ -565,46 +606,39 @@ class CircuitEnv(CustomSingleIntegrator):
             )
             obstacles = _concat_obstacles(static_obstacles, dyn_obstacles)
         else:
-            dyn_obs_pos  = jnp.zeros((0, 2), dtype=jnp.float32)
+            dyn_obs_pos = jnp.zeros((0, 2), dtype=jnp.float32)
             dyn_obs_goal = jnp.zeros((0, 2), dtype=jnp.float32)
-            obstacles    = static_obstacles
+            obstacles = static_obstacles
 
         step_key, _ = jr.split(key)
         n = self.num_agents
         garage_tile = jnp.tile(self._garage, (n, 1))
-        pickup_tile = jnp.tile(self._pickup, (n, 1))
+        pickup_by_slot = self._pickup[self._robot_circuit]
 
         env_states = self.EnvState(
-            agent          = garage_tile,
-            goal           = pickup_tile,   # overwritten on first spawn
-            obstacle       = obstacles,
-            rng_key        = step_key,
-            dyn_obs_pos    = dyn_obs_pos,
-            dyn_obs_goal   = dyn_obs_goal,
-            robot_phase    = jnp.zeros(n, dtype=jnp.int32),
-            robot_timer    = jnp.zeros(n, dtype=jnp.int32),
-            spawn_timer    = jnp.array(0, dtype=jnp.int32),
-            robots_spawned = jnp.array(0, dtype=jnp.int32),
-            robot_delivery = jnp.tile(self._delivery[0], (n, 1)),
+            agent=garage_tile,
+            goal=pickup_by_slot,
+            obstacle=obstacles,
+            rng_key=step_key,
+            dyn_obs_pos=dyn_obs_pos,
+            dyn_obs_goal=dyn_obs_goal,
+            robot_phase=jnp.zeros(n, dtype=jnp.int32),
+            robot_timer=jnp.zeros(n, dtype=jnp.int32),
+            spawn_timer=jnp.zeros(self._n_circuits, dtype=jnp.int32),
+            robots_spawned=jnp.zeros(self._n_circuits, dtype=jnp.int32),
+            robot_delivery=self._initial_robot_delivery,
+            robot_circuit=self._robot_circuit,
         )
         return self.get_graph(env_states)
 
-    # ------------------------------------------------------------------
-    # u_ref — same as parent but with epsilon guard against zero-norm
-    # ------------------------------------------------------------------
-
     def u_ref(self, graph: GraphsTuple) -> Action:
         agent = graph.type_states(type_idx=0, n_type=self.num_agents)
-        goal  = graph.type_states(type_idx=1, n_type=self.num_agents)
+        goal = graph.type_states(type_idx=1, n_type=self.num_agents)
         error = goal - agent
-        norm  = jnp.linalg.norm(error, axis=-1, keepdims=True) + 1e-6
+        norm = jnp.linalg.norm(error, axis=-1, keepdims=True) + 1e-6
         error_max = jnp.abs(error / norm * self._params["comm_radius"])
         error = jnp.clip(error, -error_max, error_max)
         return self.clip_action(error @ self._K.T)
-
-    # ------------------------------------------------------------------
-    # step — phase state machine + spawn logic
-    # ------------------------------------------------------------------
 
     def step(
         self,
@@ -614,98 +648,99 @@ class CircuitEnv(CustomSingleIntegrator):
     ) -> Tuple[GraphsTuple, Reward, Cost, Done, Info]:
         self._t += 1
 
-        agent_states   = graph.type_states(type_idx=0, n_type=self.num_agents)
-        goals          = graph.env_states.goal
-        obstacles      = graph.env_states.obstacle
-        rng_key        = graph.env_states.rng_key
-        dyn_obs_pos    = graph.env_states.dyn_obs_pos
-        dyn_obs_goal   = graph.env_states.dyn_obs_goal
-        robot_phase    = graph.env_states.robot_phase
-        robot_timer    = graph.env_states.robot_timer
-        spawn_timer    = graph.env_states.spawn_timer
+        agent_states = graph.type_states(type_idx=0, n_type=self.num_agents)
+        goals = graph.env_states.goal
+        obstacles = graph.env_states.obstacle
+        rng_key = graph.env_states.rng_key
+        dyn_obs_pos = graph.env_states.dyn_obs_pos
+        dyn_obs_goal = graph.env_states.dyn_obs_goal
+        robot_phase = graph.env_states.robot_phase
+        robot_timer = graph.env_states.robot_timer
+        spawn_timer = graph.env_states.spawn_timer
         robots_spawned = graph.env_states.robots_spawned
         robot_delivery = graph.env_states.robot_delivery
+        robot_circuit = graph.env_states.robot_circuit
 
-        # Inactive agents don't receive actions; hard-freeze at garage.
         n = self.num_agents
         garage_tile = jnp.tile(self._garage, (n, 1))
-        is_inactive = (robot_phase == _PHASE_INACTIVE)
+        is_inactive = robot_phase == _PHASE_INACTIVE
         frozen_action = jnp.where(is_inactive[:, None], jnp.zeros_like(action), self.clip_action(action))
         next_agent_states = self.agent_step_euler(agent_states, frozen_action)
         next_agent_states = jnp.where(is_inactive[:, None], garage_tile, next_agent_states)
 
-        done   = jnp.array(False)
+        done = jnp.array(False)
         reward = jnp.zeros(()).astype(jnp.float32)
         reward -= (jnp.linalg.norm(action - self.u_ref(graph), axis=1) ** 2).mean()
-        cost   = self.get_cost(graph)
+        cost = self.get_cost(graph)
 
         key = rng_key
 
-        # --- Phase state machine ---
-        timer_expired = (robot_timer + 1 >= self._dwell_steps)
-        dist_to_goal  = jnp.linalg.norm(next_agent_states - goals, axis=-1)
-        arrived       = dist_to_goal < self._goal_reach_threshold
+        dwell_by_slot = self._dwell_steps[robot_circuit]
+        timer_expired = robot_timer + 1 >= dwell_by_slot
+        dist_to_goal = jnp.linalg.norm(next_agent_states - goals, axis=-1)
+        arrived = dist_to_goal < self._goal_reach_threshold
 
-        dropoff_tile = jnp.tile(self._dropoff, (n, 1))
-        pickup_tile  = jnp.tile(self._pickup,  (n, 1))
+        pickup_by_slot = self._pickup[robot_circuit]
+        dropoff_by_slot = self._dropoff[robot_circuit]
 
         next_phase = robot_phase
-        next_phase = jnp.where((robot_phase == _PHASE_PICKUP_DWELL)   & timer_expired, _PHASE_TO_DELIVERY,    next_phase)
-        next_phase = jnp.where((robot_phase == _PHASE_TO_DELIVERY)    & arrived,       _PHASE_DELIVERY_DWELL, next_phase)
-        next_phase = jnp.where((robot_phase == _PHASE_DELIVERY_DWELL) & timer_expired, _PHASE_TO_DROPOFF,     next_phase)
-        next_phase = jnp.where((robot_phase == _PHASE_TO_DROPOFF)     & arrived,       _PHASE_DROPOFF_DWELL,  next_phase)
-        next_phase = jnp.where((robot_phase == _PHASE_DROPOFF_DWELL)  & timer_expired, _PHASE_INACTIVE,       next_phase)
+        next_phase = jnp.where((robot_phase == _PHASE_PICKUP_DWELL) & timer_expired, _PHASE_TO_DELIVERY, next_phase)
+        next_phase = jnp.where((robot_phase == _PHASE_TO_DELIVERY) & arrived, _PHASE_DELIVERY_DWELL, next_phase)
+        next_phase = jnp.where((robot_phase == _PHASE_DELIVERY_DWELL) & timer_expired, _PHASE_TO_DROPOFF, next_phase)
+        next_phase = jnp.where((robot_phase == _PHASE_TO_DROPOFF) & arrived, _PHASE_DROPOFF_DWELL, next_phase)
+        next_phase = jnp.where((robot_phase == _PHASE_DROPOFF_DWELL) & timer_expired, _PHASE_INACTIVE, next_phase)
 
-        phase_changed = (next_phase != robot_phase)
-        next_timer    = jnp.where(phase_changed, 0, robot_timer + 1)
+        phase_changed = next_phase != robot_phase
+        next_timer = jnp.where(phase_changed, 0, robot_timer + 1)
 
-        # Goals follow phase transitions.  Delivery uses the per-slot locked goal.
         new_goals = goals
-        new_goals = jnp.where((next_phase == _PHASE_TO_DELIVERY)[:, None],   robot_delivery, new_goals)
-        new_goals = jnp.where((next_phase == _PHASE_TO_DROPOFF)[:, None],    dropoff_tile,   new_goals)
-        new_goals = jnp.where((next_phase == _PHASE_INACTIVE)[:, None],      garage_tile,    new_goals)
-
-        # Teleport newly-inactive robots back to garage.
+        new_goals = jnp.where((next_phase == _PHASE_TO_DELIVERY)[:, None], robot_delivery, new_goals)
+        new_goals = jnp.where((next_phase == _PHASE_TO_DROPOFF)[:, None], dropoff_by_slot, new_goals)
+        new_goals = jnp.where((next_phase == _PHASE_INACTIVE)[:, None], garage_tile, new_goals)
         next_agent_states = jnp.where((next_phase == _PHASE_INACTIVE)[:, None], garage_tile, next_agent_states)
 
-        # --- Spawn logic ---
-        new_spawn_timer    = spawn_timer - 1
-        should_spawn       = (new_spawn_timer <= 0)
-        budget_remaining   = robots_spawned < self._total_robots
-        # Only claim a slot that was already inactive BEFORE this step.
-        any_inactive       = jnp.any(robot_phase == _PHASE_INACTIVE)
-        do_spawn           = should_spawn & any_inactive & budget_remaining
-        # Keep timer at 0 until a slot frees; reset to interval once spawn fires.
-        new_spawn_timer    = jnp.where(do_spawn, self._spawn_steps, jnp.maximum(new_spawn_timer, 0))
-        new_robots_spawned = jnp.where(do_spawn, robots_spawned + 1, robots_spawned)
+        new_spawn_timer = spawn_timer - 1
+        new_spawn_timer = jnp.maximum(new_spawn_timer, 0)
+        new_robots_spawned = robots_spawned
+        new_robot_delivery = robot_delivery
 
-        slot_scores = jnp.where(robot_phase == _PHASE_INACTIVE, jnp.arange(n), n + 1)
-        first_slot  = jnp.argmin(slot_scores)
-        spawn_mask  = (jnp.arange(n) == first_slot) & do_spawn   # (n,) bool
+        for circuit_idx in range(self._n_circuits):
+            key, deliv_key = jr.split(key)
+            circuit_mask = robot_circuit == circuit_idx
+            should_spawn = spawn_timer[circuit_idx] - 1 <= 0
+            budget_remaining = robots_spawned[circuit_idx] < self._total_robots[circuit_idx]
+            any_inactive = jnp.any((robot_phase == _PHASE_INACTIVE) & circuit_mask)
+            do_spawn = should_spawn & any_inactive & budget_remaining
 
-        # Pick a random delivery station for the spawning slot and lock it in.
-        key, deliv_key = jr.split(key)
-        deliv_idx      = jr.randint(deliv_key, (), 0, self._delivery.shape[0])
-        new_robot_delivery = jnp.where(spawn_mask[:, None],
-                                       jnp.tile(self._delivery[deliv_idx], (n, 1)),
-                                       robot_delivery)
+            slot_scores = jnp.where((robot_phase == _PHASE_INACTIVE) & circuit_mask, jnp.arange(n), n + 1)
+            first_slot = jnp.argmin(slot_scores)
+            spawn_mask = (jnp.arange(n) == first_slot) & do_spawn
 
-        next_phase        = jnp.where(spawn_mask, _PHASE_PICKUP_DWELL, next_phase)
-        next_timer        = jnp.where(spawn_mask, 0, next_timer)
-        new_goals         = jnp.where(spawn_mask[:, None], pickup_tile, new_goals)
-        next_agent_states = jnp.where(spawn_mask[:, None], pickup_tile, next_agent_states)
+            deliv_idx = jr.randint(deliv_key, (), 0, self._delivery[circuit_idx].shape[0])
+            delivery_goal = self._delivery[circuit_idx][deliv_idx]
+            new_robot_delivery = jnp.where(spawn_mask[:, None], jnp.tile(delivery_goal, (n, 1)), new_robot_delivery)
 
-        # --- Dynamic obstacle motion (only when n_dyn_obs > 0) ---
+            new_spawn_timer = new_spawn_timer.at[circuit_idx].set(
+                jnp.where(do_spawn, self._spawn_steps[circuit_idx], new_spawn_timer[circuit_idx])
+            )
+            new_robots_spawned = new_robots_spawned.at[circuit_idx].set(
+                jnp.where(do_spawn, robots_spawned[circuit_idx] + 1, robots_spawned[circuit_idx])
+            )
+            next_phase = jnp.where(spawn_mask, _PHASE_PICKUP_DWELL, next_phase)
+            next_timer = jnp.where(spawn_mask, 0, next_timer)
+            new_goals = jnp.where(spawn_mask[:, None], pickup_by_slot, new_goals)
+            next_agent_states = jnp.where(spawn_mask[:, None], pickup_by_slot, next_agent_states)
+
         if self._n_dyn_obs > 0:
-            error     = dyn_obs_goal - dyn_obs_pos
-            norm      = jnp.linalg.norm(error, axis=-1, keepdims=True) + 1e-6
+            error = dyn_obs_goal - dyn_obs_pos
+            norm = jnp.linalg.norm(error, axis=-1, keepdims=True) + 1e-6
             error_max = jnp.abs(error / norm * self._params["comm_radius"])
-            dyn_vel   = self.clip_action(jnp.clip(error, -error_max, error_max) @ self._K.T)
+            dyn_vel = self.clip_action(jnp.clip(error, -error_max, error_max) @ self._K.T)
             key, noise_key = jr.split(key)
-            dyn_vel   = self.clip_action(dyn_vel + jr.normal(noise_key, dyn_obs_pos.shape) * self._dyn_obs_speed_noise)
+            dyn_vel = self.clip_action(dyn_vel + jr.normal(noise_key, dyn_obs_pos.shape) * self._dyn_obs_speed_noise)
             new_dyn_pos = jnp.clip(dyn_obs_pos + dyn_vel * self._dt, 0.0, self.area_size)
 
-            dyn_dist  = jnp.linalg.norm(new_dyn_pos - dyn_obs_goal, axis=-1)
+            dyn_dist = jnp.linalg.norm(new_dyn_pos - dyn_obs_goal, axis=-1)
             key, dyn_goal_key = jr.split(key)
             per_obs_keys = jr.split(dyn_goal_key, self._n_dyn_obs)
             new_dyn_goals_cand = jax.vmap(
@@ -720,25 +755,26 @@ class CircuitEnv(CustomSingleIntegrator):
                 jnp.full(self._n_dyn_obs, self._dyn_obs_size),
                 jnp.zeros(self._n_dyn_obs),
             )
-            fixed_obs    = jax.tree_util.tree_map(lambda x: x[:self._n_fixed_obs], obstacles)
+            fixed_obs = jax.tree_util.tree_map(lambda x: x[:self._n_fixed_obs], obstacles)
             new_obstacles = _concat_obstacles(fixed_obs, new_dyn_obstacles)
         else:
-            new_dyn_pos    = dyn_obs_pos
-            new_dyn_goals  = dyn_obs_goal
-            new_obstacles  = obstacles
+            new_dyn_pos = dyn_obs_pos
+            new_dyn_goals = dyn_obs_goal
+            new_obstacles = obstacles
 
         next_state = self.EnvState(
-            agent          = next_agent_states,
-            goal           = new_goals,
-            obstacle       = new_obstacles,
-            rng_key        = key,
-            dyn_obs_pos    = new_dyn_pos,
-            dyn_obs_goal   = new_dyn_goals,
-            robot_phase    = next_phase,
-            robot_timer    = next_timer,
-            spawn_timer    = new_spawn_timer,
-            robots_spawned = new_robots_spawned,
-            robot_delivery = new_robot_delivery,
+            agent=next_agent_states,
+            goal=new_goals,
+            obstacle=new_obstacles,
+            rng_key=key,
+            dyn_obs_pos=new_dyn_pos,
+            dyn_obs_goal=new_dyn_goals,
+            robot_phase=next_phase,
+            robot_timer=next_timer,
+            spawn_timer=new_spawn_timer,
+            robots_spawned=new_robots_spawned,
+            robot_delivery=new_robot_delivery,
+            robot_circuit=robot_circuit,
         )
 
         info = {}
@@ -749,29 +785,21 @@ class CircuitEnv(CustomSingleIntegrator):
 
         return self.get_graph(next_state), reward, cost, done, info
 
-    # ------------------------------------------------------------------
-    # Cost — only active robots count
-    # ------------------------------------------------------------------
-
     def get_cost(self, graph: GraphsTuple) -> Cost:
         agent_states = graph.type_states(type_idx=0, n_type=self.num_agents)
-        obstacles    = graph.env_states.obstacle
-        is_active    = (graph.env_states.robot_phase > _PHASE_INACTIVE).astype(jnp.float32)
+        obstacles = graph.env_states.obstacle
+        is_active = (graph.env_states.robot_phase > _PHASE_INACTIVE).astype(jnp.float32)
 
-        agent_pos   = agent_states
-        dist        = jnp.linalg.norm(
+        agent_pos = agent_states
+        dist = jnp.linalg.norm(
             jnp.expand_dims(agent_pos, 1) - jnp.expand_dims(agent_pos, 0), axis=-1
         )
-        dist       += jnp.eye(self.num_agents) * 1e6
+        dist += jnp.eye(self.num_agents) * 1e6
         active_pair = is_active[:, None] * is_active[None, :]
-        cost  = ((self._params["car_radius"] * 2 > dist) * active_pair).any(axis=1)
-        cost  = (cost * is_active).mean()
+        cost = ((self._params["car_radius"] * 2 > dist) * active_pair).any(axis=1)
+        cost = (cost * is_active).mean()
         cost += (inside_obstacles(agent_pos, obstacles, r=self._params["car_radius"]) * is_active).mean()
         return cost
-
-    # ------------------------------------------------------------------
-    # Masks — exclude inactive robots
-    # ------------------------------------------------------------------
 
     @ft.partial(jax.jit, static_argnums=(0,))
     def safe_mask(self, graph: GraphsTuple) -> Array:
@@ -789,24 +817,20 @@ class CircuitEnv(CustomSingleIntegrator):
     def finish_mask(self, graph: GraphsTuple) -> Array:
         return jnp.zeros(self.num_agents, dtype=jnp.bool_)
 
-    # ------------------------------------------------------------------
-    # Rendering
-    # ------------------------------------------------------------------
-
     def render_video(self, rollout, video_path, Ta_is_unsafe=None, viz_opts=None, dpi=100, **kwargs):
         from .plot import render_video_circuit
         render_video_circuit(
-            rollout       = rollout,
-            video_path    = video_path,
-            side_length   = self.area_size,
-            n_agent       = self.num_agents,
-            n_rays        = self.params["n_rays"],
-            r             = self.params["car_radius"],
-            pickup_pos    = np.array(self._pickup),
-            delivery_pos  = np.array(self._delivery),
-            dropoff_pos   = np.array(self._dropoff),
-            Ta_is_unsafe  = Ta_is_unsafe,
-            viz_opts      = viz_opts,
-            dpi           = dpi,
+            rollout=rollout,
+            video_path=video_path,
+            side_length=self.area_size,
+            n_agent=self.num_agents,
+            n_rays=self.params["n_rays"],
+            r=self.params["car_radius"],
+            pickup_pos=np.array(self._pickup),
+            delivery_pos=[np.array(delivery) for delivery in self._delivery],
+            dropoff_pos=np.array(self._dropoff),
+            Ta_is_unsafe=Ta_is_unsafe,
+            viz_opts=viz_opts,
+            dpi=dpi,
             **kwargs,
         )

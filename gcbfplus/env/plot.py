@@ -176,7 +176,7 @@ def get_obs_collection(
     if isinstance(obstacles, Rectangle):
         n_obs = len(obstacles.center)
         obs_polys = [Polygon(obstacles.points[ii]) for ii in range(n_obs)]
-        obs_col = PatchCollection(obs_polys, color=color, alpha=1.0, zorder=99)
+        obs_col = MutablePatchCollection(obs_polys, color=color, alpha=1.0, zorder=99)
     elif isinstance(obstacles, Cuboid):
         obs_col = get_cuboid_collection(obstacles, alpha=alpha, facecolor=color)
     elif isinstance(obstacles, Sphere):
@@ -230,7 +230,8 @@ def render_video(
 
     # plot obstacles
     obs = graph0.env_states.obstacle
-    ax.add_collection(get_obs_collection(obs, obs_color, alpha=0.8))
+    obs_col = get_obs_collection(obs, obs_color, alpha=0.8)
+    ax.add_collection(obs_col)
 
     # plot agents
     n_hits = n_agent * n_rays
@@ -338,12 +339,18 @@ def render_video(
 
     # init function for animation
     def init_fn() -> list[plt.Artist]:
-        return [agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col, kk_text]
+        return [obs_col, agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col, kk_text]
 
     # update function for animation
     def update(kk: int) -> list[plt.Artist]:
         graph = tree_index(T_graph, kk)
         n_pos_t = graph.states[:-1, :dim]
+
+        # update obstacle positions (needed for dynamic/moving obstacles)
+        if dim == 2:
+            obs_t = graph.env_states.obstacle
+            if isinstance(obs_t, Rectangle):
+                obs_col.patches = [Polygon(obs_t.points[ii]) for ii in range(len(obs_t.center))]
 
         # update agent positions
         if dim == 2:
@@ -403,11 +410,158 @@ def render_video(
 
         kk_text.set_text("kk={:04}".format(kk))
 
-        return [agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col_t, kk_text]
+        return [obs_col, agent_col, edge_col, *agent_labels, cost_text, *safe_text, *cnt_col_t, kk_text]
 
     fps = 30.0
     spf = 1 / fps
     mspf = 1_000 * spf
     anim_T = len(T_graph.n_node)
     ani = FuncAnimation(fig, update, frames=anim_T, init_func=init_fn, interval=mspf, blit=True)
+    save_anim(ani, video_path)
+
+
+# Phase index → hex color for CircuitEnv visualization.
+_CIRCUIT_PHASE_COLORS = {
+    1: "#22aa22",   # PICKUP_DWELL   — green
+    2: "#0068ff",   # TO_DELIVERY    — blue
+    3: "#ff8800",   # DELIVERY_DWELL — orange
+    4: "#aa00cc",   # TO_DROPOFF     — purple
+    5: "#dd2200",   # DROPOFF_DWELL  — red
+}
+
+
+def render_video_circuit(
+        rollout,
+        video_path: pathlib.Path,
+        side_length: float,
+        n_agent: int,
+        n_rays: int,
+        r: float,
+        pickup_pos: np.ndarray,    # (2,)
+        delivery_pos: np.ndarray,  # (k, 2)
+        dropoff_pos: np.ndarray,   # (2,)
+        Ta_is_unsafe=None,
+        viz_opts: dict = None,
+        dpi: int = 100,
+        **kwargs,
+):
+    """Like render_video but with circuit-specific visualisation:
+    - Robots are colored by mission phase; invisible when inactive.
+    - Fixed station markers for pickup, delivery positions, and drop-off.
+    """
+    fig, ax = plt.subplots(1, 1, figsize=(10, 10), dpi=dpi)
+    ax.set_xlim(0., side_length)
+    ax.set_ylim(0., side_length)
+    ax.set(aspect="equal")
+    plt.axis("off")
+
+    T_graph = rollout.Tp1_graph
+    graph0  = tree_index(T_graph, 0)
+    n_hits  = n_agent * n_rays
+
+    # --- static obstacles ---
+    obs     = graph0.env_states.obstacle
+    obs_col = get_obs_collection(obs, "#8a0000", alpha=0.8)
+    ax.add_collection(obs_col)
+
+    # --- station markers (drawn once, never updated) ---
+    ax.plot(*pickup_pos, marker='*', markersize=20, color='#22aa22',
+            zorder=10, linestyle='none', label='Pickup')
+    ax.plot(*dropoff_pos, marker='X', markersize=16, color='#dd2200',
+            zorder=10, linestyle='none', label='Drop-off')
+    for ii, dp in enumerate(delivery_pos):
+        ax.plot(*dp, marker='s', markersize=14, color='#0068ff',
+                zorder=10, linestyle='none', label=f'Delivery {ii}')
+
+    # --- agent circles (one per slot) and goal dots (one per slot) ---
+    # All start off-screen with zero radius; updated each frame.
+    agent_circs = [plt.Circle((-10., -10.), 0., linewidth=0.0) for _ in range(n_agent)]
+    goal_circs  = [plt.Circle((-10., -10.), 0., linewidth=1.5, fill=False) for _ in range(n_agent)]
+    agent_col = MutablePatchCollection(agent_circs, match_original=False, zorder=6)
+    goal_col  = MutablePatchCollection(goal_circs,  match_original=False, zorder=5)
+    ax.add_collection(agent_col)
+    ax.add_collection(goal_col)
+
+    # --- edges ---
+    n_pos0     = np.array(graph0.states[:-1, :2])
+    all_pos0   = n_pos0
+    edge_index = np.stack([graph0.senders, graph0.receivers], axis=0)
+    is_pad     = np.any(edge_index == n_agent * 2 + n_hits, axis=0)
+    e_idx      = edge_index[:, ~is_pad]
+    e_start, e_end = all_pos0[e_idx[0]], all_pos0[e_idx[1]]
+    e_lines    = np.stack([e_start, e_end], axis=1)
+    e_colors   = ["0.3"] * len(e_start)
+    edge_col   = LineCollection(e_lines, colors=e_colors, linewidths=1, alpha=0.4, zorder=3)
+    ax.add_collection(edge_col)
+
+    # --- text ---
+    text_opts = dict(size=16, color="k", family="DejaVu Sans",
+                     weight="normal", transform=ax.transAxes)
+    cost_text = ax.text(0.02, 1.04, "Cost: 0.0000", va="bottom", **text_opts)
+    safe_text = []
+    if Ta_is_unsafe is not None:
+        safe_text = [ax.text(0.02, 1.00, "Unsafe: {}", va="bottom", **text_opts)]
+    kk_text   = ax.text(0.99, 0.99, "kk=0", va="top", ha="right", **text_opts)
+    spawned_text = ax.text(0.02, 0.99, "Spawned: 0", va="top", **text_opts)
+
+    ax.legend(loc="lower right", fontsize=10, markerscale=0.6)
+
+    def init_fn():
+        return [obs_col, agent_col, goal_col, edge_col, cost_text, *safe_text, kk_text, spawned_text]
+
+    def update(kk: int):
+        graph   = tree_index(T_graph, kk)
+        n_pos_t = np.array(graph.states[:-1, :2])
+        phases  = np.array(graph.env_states.robot_phase)   # (n_agent,) int
+
+        # Update obstacle positions (dynamic obstacles move)
+        obs_t = graph.env_states.obstacle
+        if isinstance(obs_t, Rectangle):
+            obs_col.patches = [Polygon(obs_t.points[ii]) for ii in range(len(obs_t.center))]
+
+        # Update agent and goal circles
+        agent_colors = []
+        goal_colors  = []
+        for ii in range(n_agent):
+            phase = int(phases[ii])
+            if phase == 0:  # inactive
+                agent_circs[ii].center = (-10., -10.)
+                agent_circs[ii].radius = 0.
+                goal_circs[ii].center  = (-10., -10.)
+                goal_circs[ii].radius  = 0.
+                agent_colors.append((0., 0., 0., 0.))
+                goal_colors.append((0., 0., 0., 0.))
+            else:
+                c = _CIRCUIT_PHASE_COLORS[phase]
+                agent_circs[ii].center = tuple(n_pos_t[ii])
+                agent_circs[ii].radius = r
+                goal_circs[ii].center  = tuple(n_pos_t[n_agent + ii])
+                goal_circs[ii].radius  = r * 0.5
+                agent_colors.append(c)
+                goal_colors.append(c)
+
+        agent_col.set_facecolors(agent_colors)
+        goal_col.set_facecolors(goal_colors)
+
+        # Update edges
+        e_idx_t  = np.stack([graph.senders, graph.receivers], axis=0)
+        is_pad_t = np.any(e_idx_t == n_agent * 2 + n_hits, axis=0)
+        e_idx_t  = e_idx_t[:, ~is_pad_t]
+        e_lines_t = np.stack([n_pos_t[e_idx_t[0]], n_pos_t[e_idx_t[1]]], axis=1)
+        edge_col.set_segments(e_lines_t)
+
+        # Update text
+        if kk < len(rollout.T_cost):
+            cost_text.set_text("Cost: {:5.4f}".format(float(rollout.T_cost[kk])))
+        if safe_text and Ta_is_unsafe is not None and kk < len(Ta_is_unsafe):
+            safe_text[0].set_text("Unsafe: {}".format(np.where(Ta_is_unsafe[kk])[0]))
+        kk_text.set_text("kk={:04}".format(kk))
+        spawned_text.set_text("Spawned: {}".format(int(graph.env_states.robots_spawned)))
+
+        return [obs_col, agent_col, goal_col, edge_col, cost_text, *safe_text, kk_text, spawned_text]
+
+    fps   = 30.0
+    mspf  = 1_000 / fps
+    anim_T = len(T_graph.n_node)
+    ani   = FuncAnimation(fig, update, frames=anim_T, init_func=init_fn, interval=mspf, blit=True)
     save_anim(ani, video_path)

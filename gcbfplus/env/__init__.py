@@ -32,6 +32,7 @@ def make_env(
         num_obs: Optional[int] = None,
         n_rays: Optional[int] = None,
         circuit_cfgs: Optional[list] = None,
+        traversable_rects: Optional[list] = None,
 ) -> MultiAgentEnv:
     assert env_id in ENV.keys(), f'Environment {env_id} not implemented.'
     params = dict(ENV[env_id].PARAMS)
@@ -42,11 +43,14 @@ def make_env(
         params['n_rays'] = n_rays
     if circuit_cfgs is not None:
         params['circuit_cfgs'] = circuit_cfgs
-    return ENV[env_id](
+    kwargs = dict(
         num_agents=num_agents,
         area_size=area_size,
         max_step=max_step,
         max_travel=max_travel,
         dt=0.03,
-        params=params
+        params=params,
     )
+    if traversable_rects is not None and env_id == 'CircuitEnv':
+        kwargs['traversable_rects'] = traversable_rects
+    return ENV[env_id](**kwargs)

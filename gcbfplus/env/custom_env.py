@@ -47,6 +47,7 @@ CLI (via test.py):
 from __future__ import annotations
 
 import functools as ft
+import math
 import jax
 import jax.numpy as jnp
 import jax.random as jr
@@ -60,6 +61,7 @@ from .obstacle import Rectangle
 from .utils import get_node_goal_rng, inside_obstacles
 from ..utils.graph import GraphsTuple
 from ..utils.typing import Action, Array, Cost, Done, Info, Reward, State
+from ..planning.waypoints import compute_waypoints
 
 
 # ---------------------------------------------------------------------------
@@ -471,18 +473,20 @@ class CircuitEnv(CustomSingleIntegrator):
     from typing import NamedTuple as _NT
 
     class EnvState(_NT):  # type: ignore[no-redef]
-        agent:          State
-        goal:           State
-        obstacle:       object
-        rng_key:        Array
-        dyn_obs_pos:    Array     # (n_dyn_obs, 2)
-        dyn_obs_goal:   Array     # (n_dyn_obs, 2)
-        robot_phase:    Array     # (num_agents,) int32
-        robot_timer:    Array     # (num_agents,) int32, steps in current phase
-        spawn_timer:    Array     # (n_circuits,) int32, steps until next spawn
-        robots_spawned: Array     # (n_circuits,) int32, total robots spawned so far
-        robot_delivery: Array     # (num_agents, 2), delivery goal locked at spawn
-        robot_circuit:  Array     # (num_agents,) int32, fixed circuit ownership
+        agent:               State
+        goal:                State
+        obstacle:            object
+        rng_key:             Array
+        dyn_obs_pos:         Array     # (n_dyn_obs, 2)
+        dyn_obs_goal:        Array     # (n_dyn_obs, 2)
+        robot_phase:         Array     # (num_agents,) int32
+        robot_timer:         Array     # (num_agents,) int32, steps in current phase
+        spawn_timer:         Array     # (n_circuits,) int32, steps until next spawn
+        robots_spawned:      Array     # (n_circuits,) int32, total robots spawned so far
+        robot_delivery:      Array     # (num_agents, 2), delivery goal locked at spawn
+        robot_circuit:       Array     # (num_agents,) int32, fixed circuit ownership
+        robot_waypoint_idx:  Array     # (num_agents,) int32, current waypoint in the leg
+        robot_delivery_idx:  Array     # (num_agents,) int32, delivery option index locked at spawn
 
     def __init__(
         self,
@@ -498,6 +502,8 @@ class CircuitEnv(CustomSingleIntegrator):
         max_travel: Optional[float] = None,
         dt: float = 0.03,
         params: Optional[dict] = None,
+        traversable_rects: Optional[List[dict]] = None,
+        waypoint_threshold: Optional[float] = None,
     ):
         if area_size is None:
             raise ValueError("area_size must be provided")
@@ -574,6 +580,57 @@ class CircuitEnv(CustomSingleIntegrator):
             self._delivery[int(circuit_idx)][0] for circuit_idx in np.array(self._robot_circuit)
         ]).astype(jnp.float32)
 
+        self._waypoint_threshold = waypoint_threshold or 3.0 * self._goal_reach_threshold
+        self._traversable_rects = traversable_rects  # kept for visualization
+        self._build_waypoint_arrays(traversable_rects)
+
+    def _build_waypoint_arrays(self, traversable_rects: Optional[List[dict]]) -> None:
+        """Pre-compute padded waypoint arrays for every circuit leg."""
+        # Upper bound: a path that traverses 4× the area diagonal at 1-unit spacing.
+        MAX_WP = int(math.ceil(4.0 * self.area_size))
+        n_c = self._n_circuits
+        max_n_del = max(len(self._delivery[c]) for c in range(n_c))
+
+        pickup_np = np.array([cfg.pickup_pos for cfg in self._circuit_cfgs], dtype=np.float32)
+        dropoff_np = np.array([cfg.dropoff_pos for cfg in self._circuit_cfgs], dtype=np.float32)
+
+        # Shape: (n_circuits, max_n_deliveries, MAX_WP, 2) and (n_circuits, max_n_deliveries)
+        wp_del  = np.zeros((n_c, max_n_del, MAX_WP, 2), dtype=np.float32)
+        n_del   = np.ones((n_c, max_n_del), dtype=np.int32)
+        # Shape: (n_circuits, max_n_deliveries, MAX_WP, 2) and (n_circuits, max_n_deliveries)
+        wp_drop = np.zeros((n_c, max_n_del, MAX_WP, 2), dtype=np.float32)
+        n_drop  = np.ones((n_c, max_n_del), dtype=np.int32)
+
+        for c in range(n_c):
+            pu = pickup_np[c]
+            do = dropoff_np[c]
+            deliveries = np.array(self._circuit_cfgs[c].delivery_pos, dtype=np.float32)
+
+            for d, dv in enumerate(deliveries):
+                if traversable_rects is not None:
+                    wps = compute_waypoints(pu, dv, traversable_rects)
+                else:
+                    wps = np.array([dv], dtype=np.float32)
+                n = min(len(wps), MAX_WP)
+                n_del[c, d] = n
+                wp_del[c, d, :n] = wps[:n]
+                wp_del[c, d, n:] = wps[n - 1]   # pad with destination
+
+                # dropoff leg: route from this delivery position back to dropoff
+                if traversable_rects is not None:
+                    wps = compute_waypoints(dv, do, traversable_rects)
+                else:
+                    wps = np.array([do], dtype=np.float32)
+                n = min(len(wps), MAX_WP)
+                n_drop[c, d] = n
+                wp_drop[c, d, :n] = wps[:n]
+                wp_drop[c, d, n:] = wps[n - 1]
+
+        self._wp_delivery  = jnp.array(wp_del)
+        self._wp_n_delivery = jnp.array(n_del)
+        self._wp_dropoff   = jnp.array(wp_drop)
+        self._wp_n_dropoff  = jnp.array(n_drop)
+
     def reset(self, key: Array) -> GraphsTuple:
         self._t = 0
 
@@ -628,6 +685,8 @@ class CircuitEnv(CustomSingleIntegrator):
             robots_spawned=jnp.zeros(self._n_circuits, dtype=jnp.int32),
             robot_delivery=self._initial_robot_delivery,
             robot_circuit=self._robot_circuit,
+            robot_waypoint_idx=jnp.zeros(n, dtype=jnp.int32),
+            robot_delivery_idx=jnp.zeros(n, dtype=jnp.int32),
         )
         return self.get_graph(env_states)
 
@@ -660,6 +719,8 @@ class CircuitEnv(CustomSingleIntegrator):
         robots_spawned = graph.env_states.robots_spawned
         robot_delivery = graph.env_states.robot_delivery
         robot_circuit = graph.env_states.robot_circuit
+        robot_waypoint_idx = graph.env_states.robot_waypoint_idx
+        robot_delivery_idx = graph.env_states.robot_delivery_idx
 
         n = self.num_agents
         garage_tile = jnp.tile(self._garage, (n, 1))
@@ -677,32 +738,76 @@ class CircuitEnv(CustomSingleIntegrator):
 
         dwell_by_slot = self._dwell_steps[robot_circuit]
         timer_expired = robot_timer + 1 >= dwell_by_slot
-        dist_to_goal = jnp.linalg.norm(next_agent_states - goals, axis=-1)
-        arrived = dist_to_goal < self._goal_reach_threshold
+
+        # --- Waypoint-aware arrival detection ---
+        # Current waypoint goal per robot (falls through to `goals` for non-travel phases).
+        wp_del  = self._wp_delivery[robot_circuit, robot_delivery_idx, robot_waypoint_idx]
+        wp_drop = self._wp_dropoff[robot_circuit, robot_delivery_idx, robot_waypoint_idx]
+        current_wp = jnp.where(
+            (robot_phase == _PHASE_TO_DELIVERY)[:, None], wp_del,
+            jnp.where((robot_phase == _PHASE_TO_DROPOFF)[:, None], wp_drop, goals),
+        )
+
+        dist_to_wp = jnp.linalg.norm(next_agent_states - current_wp, axis=-1)
+        wp_advance_hit = dist_to_wp < self._waypoint_threshold       # looser: advances intermediate wps
+        wp_arrived_hit = dist_to_wp < self._goal_reach_threshold     # tighter: confirms final arrival
+
+        n_del_per_robot  = self._wp_n_delivery[robot_circuit, robot_delivery_idx]
+        n_drop_per_robot = self._wp_n_dropoff[robot_circuit, robot_delivery_idx]
+        is_last_del  = robot_waypoint_idx >= n_del_per_robot  - 1
+        is_last_drop = robot_waypoint_idx >= n_drop_per_robot - 1
+
+        # Phase transitions fire only when the robot is at its final waypoint.
+        arrived_del  = wp_arrived_hit & (robot_phase == _PHASE_TO_DELIVERY) & is_last_del
+        arrived_drop = wp_arrived_hit & (robot_phase == _PHASE_TO_DROPOFF)  & is_last_drop
 
         pickup_by_slot = self._pickup[robot_circuit]
         dropoff_by_slot = self._dropoff[robot_circuit]
 
         next_phase = robot_phase
         next_phase = jnp.where((robot_phase == _PHASE_PICKUP_DWELL) & timer_expired, _PHASE_TO_DELIVERY, next_phase)
-        next_phase = jnp.where((robot_phase == _PHASE_TO_DELIVERY) & arrived, _PHASE_DELIVERY_DWELL, next_phase)
+        next_phase = jnp.where(arrived_del,  _PHASE_DELIVERY_DWELL, next_phase)
         next_phase = jnp.where((robot_phase == _PHASE_DELIVERY_DWELL) & timer_expired, _PHASE_TO_DROPOFF, next_phase)
-        next_phase = jnp.where((robot_phase == _PHASE_TO_DROPOFF) & arrived, _PHASE_DROPOFF_DWELL, next_phase)
+        next_phase = jnp.where(arrived_drop, _PHASE_DROPOFF_DWELL,  next_phase)
         next_phase = jnp.where((robot_phase == _PHASE_DROPOFF_DWELL) & timer_expired, _PHASE_INACTIVE, next_phase)
 
         phase_changed = next_phase != robot_phase
         next_timer = jnp.where(phase_changed, 0, robot_timer + 1)
 
+        # Advance waypoint index for intermediate waypoints.
+        advance = wp_advance_hit & (
+            ((robot_phase == _PHASE_TO_DELIVERY) & ~is_last_del) |
+            ((robot_phase == _PHASE_TO_DROPOFF)  & ~is_last_drop)
+        )
+        next_wp_idx = jnp.where(advance, robot_waypoint_idx + 1, robot_waypoint_idx)
+        # Reset to 0 only on ENTRY into a travel phase, not for robots already travelling.
+        entering_delivery = phase_changed & (next_phase == _PHASE_TO_DELIVERY)
+        entering_dropoff  = phase_changed & (next_phase == _PHASE_TO_DROPOFF)
+        next_wp_idx = jnp.where(entering_delivery | entering_dropoff, 0, next_wp_idx)
+
+        # Point goals to the first waypoint only on phase entry.
+        first_wp_del  = self._wp_delivery[robot_circuit, robot_delivery_idx, 0]
+        first_wp_drop = self._wp_dropoff[robot_circuit, robot_delivery_idx, 0]
         new_goals = goals
-        new_goals = jnp.where((next_phase == _PHASE_TO_DELIVERY)[:, None], robot_delivery, new_goals)
-        new_goals = jnp.where((next_phase == _PHASE_TO_DROPOFF)[:, None], dropoff_by_slot, new_goals)
-        new_goals = jnp.where((next_phase == _PHASE_INACTIVE)[:, None], garage_tile, new_goals)
+        new_goals = jnp.where(entering_delivery[:, None], first_wp_del,  new_goals)
+        new_goals = jnp.where(entering_dropoff[:, None],  first_wp_drop, new_goals)
+        new_goals = jnp.where((next_phase == _PHASE_INACTIVE)[:, None],  garage_tile,  new_goals)
+        # Propagate waypoint advancement within an ongoing travel phase.
+        next_wp_del  = self._wp_delivery[robot_circuit, robot_delivery_idx, next_wp_idx]
+        next_wp_drop = self._wp_dropoff[robot_circuit, robot_delivery_idx, next_wp_idx]
+        new_goals = jnp.where(
+            advance[:, None] & (robot_phase == _PHASE_TO_DELIVERY)[:, None], next_wp_del,  new_goals
+        )
+        new_goals = jnp.where(
+            advance[:, None] & (robot_phase == _PHASE_TO_DROPOFF)[:, None],  next_wp_drop, new_goals
+        )
         next_agent_states = jnp.where((next_phase == _PHASE_INACTIVE)[:, None], garage_tile, next_agent_states)
 
         new_spawn_timer = spawn_timer - 1
         new_spawn_timer = jnp.maximum(new_spawn_timer, 0)
         new_robots_spawned = robots_spawned
         new_robot_delivery = robot_delivery
+        new_robot_delivery_idx = robot_delivery_idx
 
         for circuit_idx in range(self._n_circuits):
             key, deliv_key = jr.split(key)
@@ -719,6 +824,7 @@ class CircuitEnv(CustomSingleIntegrator):
             deliv_idx = jr.randint(deliv_key, (), 0, self._delivery[circuit_idx].shape[0])
             delivery_goal = self._delivery[circuit_idx][deliv_idx]
             new_robot_delivery = jnp.where(spawn_mask[:, None], jnp.tile(delivery_goal, (n, 1)), new_robot_delivery)
+            new_robot_delivery_idx = jnp.where(spawn_mask, jnp.full(n, deliv_idx, dtype=jnp.int32), new_robot_delivery_idx)
 
             new_spawn_timer = new_spawn_timer.at[circuit_idx].set(
                 jnp.where(do_spawn, self._spawn_steps[circuit_idx], new_spawn_timer[circuit_idx])
@@ -730,6 +836,8 @@ class CircuitEnv(CustomSingleIntegrator):
             next_timer = jnp.where(spawn_mask, 0, next_timer)
             new_goals = jnp.where(spawn_mask[:, None], pickup_by_slot, new_goals)
             next_agent_states = jnp.where(spawn_mask[:, None], pickup_by_slot, next_agent_states)
+            # Spawned robots start with waypoint index 0 (reset already handled above for TO_DELIVERY).
+            next_wp_idx = jnp.where(spawn_mask, 0, next_wp_idx)
 
         if self._n_dyn_obs > 0:
             error = dyn_obs_goal - dyn_obs_pos
@@ -775,6 +883,8 @@ class CircuitEnv(CustomSingleIntegrator):
             robots_spawned=new_robots_spawned,
             robot_delivery=new_robot_delivery,
             robot_circuit=robot_circuit,
+            robot_waypoint_idx=next_wp_idx,
+            robot_delivery_idx=new_robot_delivery_idx,
         )
 
         info = {}
@@ -829,6 +939,7 @@ class CircuitEnv(CustomSingleIntegrator):
             pickup_pos=np.array(self._pickup),
             delivery_pos=[np.array(delivery) for delivery in self._delivery],
             dropoff_pos=np.array(self._dropoff),
+            traversable_rects=self._traversable_rects,
             Ta_is_unsafe=Ta_is_unsafe,
             viz_opts=viz_opts,
             dpi=dpi,

@@ -429,6 +429,29 @@ _CIRCUIT_PHASE_COLORS = {
     5: "#dd2200",   # DROPOFF_DWELL  — red
 }
 
+# Traversable-rectangle type → (facecolor, edgecolor), matching reference map style.
+_RECT_TYPE_STYLES: dict = {
+    "broad_staging_area":       ("#d6eaf8", "#4a90d9"),
+    "broad_vertical_corridor":  ("#d6eaf8", "#4a90d9"),
+    "broad_pick_drop_area":     ("#d5f5e3", "#27ae60"),
+    "main_horizontal_corridor": ("#fdebd0", "#e67e22"),
+    "thin_delivery_lane":       ("#e8eaf6", "#5c6bc0"),
+    "thin_delivery_access":     ("#fce4ec", "#e91e63"),
+}
+_RECT_TYPE_DEFAULT = ("#f5f5f5", "#999999")
+
+# Per-circuit station colors (pickup / delivery / dropoff share the circuit's color).
+_CIRCUIT_PALETTE = [
+    "#2196f3",  # blue
+    "#ff9800",  # orange
+    "#4caf50",  # green
+    "#e53935",  # red
+    "#9c27b0",  # purple
+    "#00bcd4",  # cyan
+    "#ff5722",  # deep-orange
+    "#795548",  # brown
+]
+
 
 def render_video_circuit(
         rollout,
@@ -437,9 +460,10 @@ def render_video_circuit(
         n_agent: int,
         n_rays: int,
         r: float,
-        pickup_pos: np.ndarray,    # (2,) or (n_circuits, 2)
-        delivery_pos,              # (k, 2), (n_circuits, k, 2), or list[(k_i, 2)]
-        dropoff_pos: np.ndarray,   # (2,) or (n_circuits, 2)
+        pickup_pos: np.ndarray,              # (2,) or (n_circuits, 2)
+        delivery_pos,                         # (k, 2), (n_circuits, k, 2), or list[(k_i, 2)]
+        dropoff_pos: np.ndarray,             # (2,) or (n_circuits, 2)
+        traversable_rects: Optional[list] = None,
         Ta_is_unsafe=None,
         viz_opts: dict = None,
         dpi: int = 100,
@@ -449,13 +473,12 @@ def render_video_circuit(
     - Robots are colored by mission phase; invisible when inactive.
     - Fixed station markers for one or more pickup/delivery/drop-off groups.
     """
-    fig, ax = plt.subplots(1, 1, figsize=(10, 10), dpi=dpi)
+    fig, ax = plt.subplots(1, 1, figsize=(20, 10), dpi=dpi)
 
     def set_full_area_view():
         ax.set_xlim(0.0, side_length)
-        ax.set_ylim(0.0, side_length)
+        ax.set_ylim(side_length / 4, 3 * side_length / 4)
         ax.set_aspect("equal", adjustable="box")
-        ax.set_box_aspect(1)
         ax.margins(0.0)
         ax.autoscale(False)
 
@@ -489,22 +512,52 @@ def render_video_circuit(
     else:
         delivery_groups = [np.asarray(group, dtype=float) for group in delivery_pos]
 
+    # --- traversable-area background (colored by rect type, matching reference map) ---
+    if traversable_rects:
+        from matplotlib.patches import Rectangle as MplRect
+        seen_rect_types: set = set()
+        for rect in traversable_rects:
+            w = rect["x_max"] - rect["x_min"]
+            h = rect["y_max"] - rect["y_min"]
+            rtype = rect.get("type", "")
+            fc, ec = _RECT_TYPE_STYLES.get(rtype, _RECT_TYPE_DEFAULT)
+            legend_label = rtype.replace("_", " ") if rtype and rtype not in seen_rect_types else None
+            seen_rect_types.add(rtype)
+            patch = MplRect(
+                (rect["x_min"], rect["y_min"]), w, h,
+                linewidth=0.8, edgecolor=ec, facecolor=fc,
+                alpha=0.55, zorder=1, label=legend_label,
+            )
+            ax.add_patch(patch)
+
     # --- static obstacles ---
     obs     = graph0.env_states.obstacle
     obs_col = get_obs_collection(obs, "#8a0000", alpha=0.8)
     ax.add_collection(obs_col)
 
-    # --- station markers (drawn once, never updated) ---
+    # --- station markers (drawn once, never updated) — large circles per circuit ---
+    _marker_kw = dict(linestyle='none', markeredgecolor='k', markeredgewidth=0.7, zorder=10)
+    _label_kw  = dict(ha='center', va='center', fontsize=7, fontweight='bold', color='white', zorder=11)
+    _legend_seen: set = set()
     for circuit_idx, pickup in enumerate(pickup_pos):
-        ax.plot(*pickup, marker='*', markersize=20, color='#22aa22',
-                zorder=10, linestyle='none', label='Pickup' if circuit_idx == 0 else None)
+        cc = _CIRCUIT_PALETTE[circuit_idx % len(_CIRCUIT_PALETTE)]
+        lbl = 'Pickup (P)' if 'pickup' not in _legend_seen else None
+        _legend_seen.add('pickup')
+        ax.plot(*pickup, marker='o', markersize=18, color=cc, label=lbl, **_marker_kw)
+        ax.text(pickup[0], pickup[1], 'P', **_label_kw)
     for circuit_idx, dropoff in enumerate(dropoff_pos):
-        ax.plot(*dropoff, marker='X', markersize=16, color='#dd2200',
-                zorder=10, linestyle='none', label='Drop-off' if circuit_idx == 0 else None)
+        cc = _CIRCUIT_PALETTE[circuit_idx % len(_CIRCUIT_PALETTE)]
+        lbl = 'Drop-off (R)' if 'dropoff' not in _legend_seen else None
+        _legend_seen.add('dropoff')
+        ax.plot(*dropoff, marker='o', markersize=18, color=cc, label=lbl, **_marker_kw)
+        ax.text(dropoff[0], dropoff[1], 'R', **_label_kw)
     for circuit_idx, deliveries in enumerate(delivery_groups):
+        cc = _CIRCUIT_PALETTE[circuit_idx % len(_CIRCUIT_PALETTE)]
         for ii, dp in enumerate(deliveries):
-            ax.plot(*dp, marker='s', markersize=14, color='#0068ff',
-                    zorder=10, linestyle='none', label='Delivery' if circuit_idx == 0 and ii == 0 else None)
+            lbl = 'Delivery (D)' if 'delivery' not in _legend_seen else None
+            _legend_seen.add('delivery')
+            ax.plot(*dp, marker='s', markersize=14, color=cc, label=lbl, **_marker_kw)
+            ax.text(dp[0], dp[1], 'D', **_label_kw)
 
     # --- agent circles (one per slot) and goal dots (one per slot) ---
     # All start off-screen with zero radius; updated each frame.
@@ -537,7 +590,8 @@ def render_video_circuit(
     kk_text   = ax.text(0.99, 0.99, "kk=0", va="top", ha="right", **text_opts)
     spawned_text = ax.text(0.02, 0.99, "Spawned: []", va="top", **text_opts)
 
-    ax.legend(loc="lower right", fontsize=10, markerscale=0.6)
+    ax.legend(loc="upper right", fontsize=9, markerscale=0.7,
+              framealpha=0.85, edgecolor="0.7", borderpad=0.6)
 
     def init_fn():
         set_full_area_view()
